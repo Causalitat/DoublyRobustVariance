@@ -1,10 +1,11 @@
-#Program: FUN_v2.r
-#Purpose: This program contains revised functions for DR estimators that can handle categorical covariates.
+# Program: FUN_flexible.r
+# Purpose: This program contains a consolidated and corrected set of flexible functions for DR estimators.
 
 library(numDeriv)
 library(boot)
 library(geex)
 library(resample)
+library(pscl)
 
 # Helper function to sanitize formula for a given dataset
 sanitize_formula_for_data <- function(formula, data) {
@@ -79,6 +80,9 @@ IF_Var <- function(exposure,outcome,prop.score,Yhat0,Yhat1,est.DR){
 
 #### Classic (Plug-in) AIPW Estimation ####
 
+# Flexible design: This function is flexible because it does not hardcode
+# variable names. It uses grab_design_matrix and grab_psiFUN to extract
+# the model structure and score functions from the fitted model objects.
 estfun_PI <- function(data,models){
 
   X<-data$X
@@ -148,6 +152,9 @@ gdm <- \(data, model) {
   grab_design_matrix(data = data, rhs_formula = grab_fixed_formula(model))
 }
 
+# Flexible design: This function is flexible because it does not hardcode
+# variable names. It uses grab_design_matrix and grab_psiFUN to extract
+# the model structure and score functions from the fitted model objects.
 estfun_WTD <- \(data, models) {
   X <- data$X
   Xe <- gdm(data, models$e)
@@ -212,6 +219,9 @@ ScoreWTD_tar<- function(Y_sc,mu,W){
   c(W*(Y_sc-mu))
 }
 
+# Flexible design: This function is flexible because it does not hardcode
+# variable names. It uses grab_design_matrix and grab_psiFUN to extract
+# the model structure and score functions from the fitted model objects.
 estfun_TMLE <- function(data,models){
 
   X<-data$X
@@ -285,145 +295,3 @@ geex_TMLE <- function(data, propensity_formula, outcome_formula, tar0.IV, tar1.I
 
   return(DR.TMLE.all)
 }
-
-
-##########################################################################################################
-#### Bootstrap Estimators ####
-##########################################################################################################
-
-### Plug-in AIPW
-
-bootstrap_PIAIPW <- function(B, bootdata, propensity_formula, outcome_formula){
-  if(B == 0) return(0)
-  if(B>0){
-    boot.est <- matrix(NaN, nrow = B, ncol = 1)
-    datbi<-samp.bootstrap(nrow(bootdata), B)
-    for(i in 1:B){
-      dati <- bootdata[datbi[,i],]
-      skip_to_next=FALSE
-
-      safe_prop_formula <- sanitize_formula_for_data(propensity_formula, dati)
-      safe_out_formula <- sanitize_formula_for_data(outcome_formula, dati)
-
-      tryCatch(prop.model  <- glm(safe_prop_formula, data = dati, family = binomial), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$PS<-predict(prop.model,dati, type="response")
-        dati$IPTW<-ifelse(dati$X==1,dati$PS^(-1),(1-dati$PS)^(-1))}
-
-      alltrt.boot<-alluntrt.boot<-dati
-      alltrt.boot$X<-1
-      alluntrt.boot$X<-0
-
-      tryCatch(out.model.unwt  <- glm(safe_out_formula, data = dati), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$Y0.unwt<-(predict(out.model.unwt, alluntrt.boot, type = "response"))
-        dati$Y1.unwt<-(predict(out.model.unwt, alltrt.boot, type = "response"))
-
-        CM1.PI<-mean(((dati$X*dati$Y-(dati$X-dati$PS)*dati$Y1.unwt))/dati$PS)
-        CM0.PI<-mean((((1-dati$X)*dati$Y+(dati$X-dati$PS)*dati$Y0.unwt))/(1-dati$PS))
-        boot.est [i]<-CM1.PI - CM0.PI}
-      if(skip_to_next==TRUE) {
-        boot.est [i]<-NA}
-    }
-    boot.se<-sd(boot.est,na.rm=TRUE)
-    return(boot.se)
-  }}
-
-
-### Weighted Regression AIPW
-
-bootstrap_WRAIPW <- function(B, bootdata, propensity_formula, outcome_formula){
-  if(B == 0) return(0)
-  if(B>0){
-    boot.est <- matrix(NaN, nrow = B, ncol = 1)
-    datbi<-samp.bootstrap(nrow(bootdata), B)
-    for(i in 1:B){
-      dati <- bootdata[datbi[,i],]
-      skip_to_next=FALSE
-
-      safe_prop_formula <- sanitize_formula_for_data(propensity_formula, dati)
-      safe_out_formula <- sanitize_formula_for_data(outcome_formula, dati)
-
-      tryCatch(prop.model  <- glm(safe_prop_formula, data = dati, family =binomial), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$PS<-predict(prop.model,dati, type="response")
-        dati$IPTW<-ifelse(dati$X==1,dati$PS^(-1),(1-dati$PS)^(-1))}
-
-      alltrt.boot<-alluntrt.boot<-dati
-      alltrt.boot$X<-1
-      alluntrt.boot$X<-0
-
-      tryCatch(out.model.wt  <- glm(safe_out_formula, data = dati,weights=IPTW), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$Y0.wt<-(predict(out.model.wt, alluntrt.boot, type = "response"))
-        dati$Y1.wt<-(predict(out.model.wt, alltrt.boot, type = "response"))
-
-        CM0.WTD<-mean(dati$Y0.wt)
-        CM1.WTD<-mean(dati$Y1.wt)
-        boot.est [i]<-CM1.WTD - CM0.WTD}
-
-      if(skip_to_next==TRUE) {
-        boot.est [i]<-NA}
-    }
-    boot.se<-sd(boot.est,na.rm=TRUE)
-    return(boot.se)
-  }}
-
-
-### TMLE
-
-bootstrap_TMLE <- function(B, bootdata, propensity_formula, outcome_formula){
-  if(B == 0) return(0)
-  if(B>0){
-    boot.est <- matrix(NaN, nrow = B, ncol = 1)
-    datbi<-samp.bootstrap(nrow(bootdata), B)
-    for(i in 1:B){
-      dati <- bootdata[datbi[,i],]
-      skip_to_next=FALSE
-
-      safe_prop_formula <- sanitize_formula_for_data(propensity_formula, dati)
-      safe_out_formula <- sanitize_formula_for_data(outcome_formula, dati)
-
-      tryCatch(prop.model  <- glm(safe_prop_formula, data = dati, family =binomial), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$PS<-predict(prop.model,dati, type="response")}
-
-      alltrt.boot<-alluntrt.boot<-dati
-      alltrt.boot$X<-1
-      alluntrt.boot$X<-0
-
-      a.boot<-min(dati$Y)
-      b.boot<-max(dati$Y)
-      dati$a.boot<-a.boot
-      dati$b.boot<-b.boot
-      dati$Y_scaled<-(dati$Y-a.boot)/(b.boot-a.boot)
-
-      tryCatch(out.model.sc.unwt <- glm(safe_out_formula, data = dati), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$Y0.sc.unwt<-(predict(out.model.sc.unwt, alluntrt.boot, type = "response"))
-        dati$Y1.sc.unwt<-(predict(out.model.sc.unwt, alltrt.boot, type = "response"))
-
-        dati$Y0.sc.unwt<-ifelse(dati$Y0.sc.unwt<min(dati$Y_scaled),min(dati$Y_scaled),dati$Y0.sc.unwt)
-        dati$Y0.sc.unwt<-ifelse(dati$Y0.sc.unwt>max(dati$Y_scaled),max(dati$Y_scaled),dati$Y0.sc.unwt)
-
-        dati$Y1.sc.unwt<-ifelse(dati$Y1.sc.unwt<min(dati$Y_scaled),min(dati$Y_scaled),dati$Y1.sc.unwt)
-        dati$Y1.sc.unwt<-ifelse(dati$Y1.sc.unwt>max(dati$Y_scaled),max(dati$Y_scaled),dati$Y1.sc.unwt)}
-
-      tryCatch(target.model.Y0.boot <- glm(Y_scaled ~ 1, offset=logit(Y0.sc.unwt), weights = (1-X)/(1-PS),
-                                           family = binomial(), data = dati), error = function(e) { skip_to_next <<- TRUE})
-      tryCatch(target.model.Y1.boot <- glm(Y_scaled ~ 1, offset=logit(Y1.sc.unwt), weights = X/PS,
-                                           family = binomial(), data = dati), error = function(e) { skip_to_next <<- TRUE})
-      if(skip_to_next==FALSE) {
-        dati$Y0.TMLE<-inv.logit(logit(dati$Y0.sc.unwt)+coef(target.model.Y0.boot)[1])*(b.boot-a.boot)+a.boot
-        dati$Y1.TMLE<-inv.logit(logit(dati$Y1.sc.unwt)+coef(target.model.Y1.boot)[1])*(b.boot-a.boot)+a.boot
-        CM0.TMLE<-mean(dati$Y0.TMLE)
-        CM1.TMLE<-mean(dati$Y1.TMLE)
-        boot.est [i]<-CM1.TMLE-CM0.TMLE}
-
-      if(skip_to_next==TRUE) {
-        boot.est [i]<-NA}
-
-    }
-    boot.se<-sd(boot.est,na.rm=TRUE)
-    return(boot.se)
-  }}
