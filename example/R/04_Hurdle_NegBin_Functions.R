@@ -359,6 +359,12 @@ estfun_WTD_Hurdle_NB <- function(data, models) {
     psi_ate <- mu1 - mu0 - ate
     
     scores <- cbind(score_e, score_z_wtd, score_c_wtd, psi_cm1, psi_cm0, psi_ate)
+    scores <- as.matrix(scores)
+    
+    if(ncol(scores) != length(theta)) {
+       stop(sprintf("Mismatch: Theta len=%d vs Scores cols=%d", length(theta), ncol(scores)))
+    }
+
     return(unname(scores))
   }
 }
@@ -375,13 +381,14 @@ geex_WTD_Hurdle_NB <- function(data,
   
   # 2. Fit Weighted Hurdle Zero
   data$Y_bin <- as.numeric(data$Y > 0)
-  m_zero <- glm(zero_formula, data = data, family = binomial, weights = weights)
+  data$wts <- weights # Attach to data to avoid scoping issues
+  m_zero <- glm(zero_formula, data = data, family = binomial, weights = wts)
   
   # 3. Fit Weighted Count (Initial Estimate)
   data_pos <- data[data$Y > 0, ]
   # Subset weights for positive cases
-  # Note: weights vector aligns with 'data'. Need to subset.
-  weights_pos <- weights[data$Y > 0]
+  weights_pos <- data$wts[data$Y > 0]
+  data_pos$weights_pos <- weights_pos # Attach to data_pos
   
   m_count_nb <- tryCatch({
     glm.nb(count_formula, data = data_pos, weights = weights_pos)
@@ -401,6 +408,7 @@ geex_WTD_Hurdle_NB <- function(data,
   root_c <- start_beta_c
   
   # 4. Roots for Means
+  # IMPORTANT: Must use the formulas provided (interactions) to generate correct matrix width
   Xc_full <- model.matrix(count_formula, data)
   Xz_full <- model.matrix(zero_formula, data)
   
@@ -427,6 +435,7 @@ geex_WTD_Hurdle_NB <- function(data,
   m0_start <- mean(m0_vec)
   
   roots <- c(coef(m_ps), coef(m_zero), root_c, m1_start, m0_start, m1_start - m0_start)
+  roots[is.na(roots)] <- 0 # Handle aliased coefficients
   roots <- unname(roots)
   
   # Models list
@@ -437,18 +446,97 @@ geex_WTD_Hurdle_NB <- function(data,
                  theta_fixed = theta_est)
   
   # GEEX
-  geex_results <- m_estimate(
-    estFUN = estfun_WTD_Hurdle_NB,
-    data = data,
-    roots = roots,
-    compute_roots = FALSE,
-    outer_args = list(models = models)
-  )
+  # GEEX with Manual Fallback
+  geex_results <- tryCatch({
+    m_estimate(
+      estFUN = estfun_WTD_Hurdle_NB,
+      data = data,
+      roots = roots,
+      compute_roots = FALSE,
+      outer_args = list(models = models)
+    )
+  }, error = function(e) {
+    # If geex fails (e.g. non-conformable args), verify dimensions manually
+    # and compute sandwich variance directly
+    
+    warning("geex::m_estimate failed (likely dimension mismatch). Falling back to manual Sandwich Variance.")
+    
+    # 1. Get the Score Function
+    psi_fun_closure <- estfun_WTD_Hurdle_NB(data, models = models)
+    
+    # 2. Gradient (Bread) -> A
+    # Sum scores to get gradient vector func
+    grad_fun <- function(th) {
+      S <- psi_fun_closure(th)
+      colSums(S)
+    }
+    
+    # Jacobian of Gradient
+    # Note: numDeriv::jacobian returns d(grad)/d(theta)
+    # Dimensions: Length(Grad) x Length(Theta)
+    # Since Grad is P-vector and Theta is P-vector, A is PxP
+    if(!requireNamespace("numDeriv", quietly = TRUE)) stop("Need numDeriv for manual fallback")
+    A <- numDeriv::jacobian(grad_fun, roots)
+    
+    # 3. Meat -> B
+    # Crossprod of scores (N x P)
+    scores <- psi_fun_closure(roots)
+    B <- crossprod(scores)
+    
+    # 4. Variance V = A^-1 B (A^-1)^T
+    Ainv <- tryCatch({ solve(A) }, error = function(e) {
+      stop("Manual Sandwich failed: Bread matrix A is singular.")
+    })
+    
+    V <- Ainv %*% B %*% t(Ainv)
+    
+    # 5. Construct a Pseudo-GEEX object or just return list
+    # Since we only use estimates and vcov usually:
+    list(estimates = roots, vcov = V)
+  })
   
-  n_params <- length(geex_results@estimates)
-  est <- geex_results@estimates[n_params]
-  se <- sqrt(geex_results@vcov[n_params, n_params])
+  if(inherits(geex_results, "geex")) {
+    n_params <- length(geex_results@estimates)
+    est <- geex_results@estimates[n_params]
+    se <- sqrt(geex_results@vcov[n_params, n_params])
+  } else {
+    # Manual Fallback Result
+    n_params <- length(geex_results$estimates)
+    est <- geex_results$estimates[n_params]
+    se <- sqrt(geex_results$vcov[n_params, n_params])
+  }
   
   return(list(result=data.frame(ATE=est, SE=se, Type="WTD-Hurdle-ZTNB"), 
               theta_used=theta_est))
+}
+
+# ------------------------------------------------------------------------------
+# 5. Interacted Weighted Hurdle Wrapper
+# ------------------------------------------------------------------------------
+
+geex_WTD_Hurdle_NB_Int <- function(data, 
+                                   propensity_formula, 
+                                   covariate_formula) {
+  
+  # 1. Parse Covariates and Construct Interaction Formulas
+  # Input assumed: ~ Z1 + Z2
+  
+  # Convert formula to string to manipulate
+  cov_terms <- attr(terms(covariate_formula), "term.labels")
+  cov_str <- paste(cov_terms, collapse = " + ")
+  
+  # Construct Interaction Formula: Y ~ X * (Z1 + Z2)
+  # This expands to: Y ~ X + Z1 + Z2 + X:Z1 + X:Z2
+  
+  str_zero <- paste("as.numeric(Y > 0) ~ X * (", cov_str, ")")
+  str_count <- paste("Y ~ X * (", cov_str, ")")
+  
+  f_zero_int <- as.formula(str_zero)
+  f_count_int <- as.formula(str_count)
+  
+  # 2. Call the Weighted Estimator with Interacted Formulas
+  return(geex_WTD_Hurdle_NB(data, 
+                            propensity_formula, 
+                            f_zero_int, 
+                            f_count_int))
 }
