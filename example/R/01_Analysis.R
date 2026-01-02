@@ -11,6 +11,9 @@ library(stats)
 #specify number of bootstrap resamples
 num.boots<-1000
 
+#set working directory
+setwd("/Users/user/Documents/Replicate_Gemini/DoublyRobustVariance/example/R")
+
 
 #bring in example dataset: 
 ### outcome=Y, exposure=X, covariates=(Z1, Z2, Z3)
